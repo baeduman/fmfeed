@@ -27,14 +27,34 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
 
-      # cron 밀림과 별개로 실행 시각 지터를 줌
+      # cron 밀림과 별개로 실행 시각 지터
       - name: Jitter
         run: sleep $(( (RANDOM % 300) ))
 
-      - name: Generate feed
+      - name: Generate feed (headless)
+        id: gen1
+        env:
+          FM_COOKIES: ${{ secrets.FM_COOKIES }}
         run: node scraper/scraper.mjs
 
+      # headless가 Turnstile에 막히면 실창(chrome window under xvfb)으로 재시도
+      - name: Generate feed (headed fallback)
+        id: gen2
+        if: steps.gen1.outcome == 'failure'
+        env:
+          FM_COOKIES: ${{ secrets.FM_COOKIES }}
+        run: xvfb-run -a node scraper/scraper.mjs --headed
+
+      - name: Upload challenge artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: challenge-artifacts
+          path: artifacts/
+          if-no-files-found: ignore
+
       - name: Commit feed.xml
+        if: always() && (steps.gen1.outcome == 'success' || steps.gen2.outcome == 'success')
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

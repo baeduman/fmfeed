@@ -12,6 +12,16 @@ const SITE_BASE = 'https://www.fmkorea.com';
 const INCLUDE_NOTICE = process.env.INCLUDE_NOTICE === '1';
 const FORCE_BROWSER = process.env.FORCE_BROWSER === '1';
 const HEADED = process.argv.includes('--headed');
+const FM_COOKIES = (process.env.FM_COOKIES || '').trim();
+
+function cookieHeaderPairs() {
+  // "a=b; c=d" → [{name, value}]
+  return FM_COOKIES.split(';').map((p) => p.trim()).filter(Boolean).map((p) => {
+    const i = p.indexOf('=');
+    if (i <= 0) return null;
+    return { name: p.slice(0, i).trim(), value: p.slice(i + 1).trim() };
+  }).filter(Boolean);
+}
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
 const FETCH_HEADERS = {
@@ -29,13 +39,16 @@ function isBoardHtml(html) {
 }
 
 async function tryFetch() {
+  const headers = { 'User-Agent': UA, ...FETCH_HEADERS };
+  if (FM_COOKIES) headers['Cookie'] = FM_COOKIES;
   const res = await fetch(BOARD_URL, {
-    headers: { 'User-Agent': UA, ...FETCH_HEADERS },
+    headers,
     signal: AbortSignal.timeout(25000),
     redirect: 'follow',
   });
   const html = await res.text();
-  console.log('[fetch] status=', res.status, 'bytes=', html.length, 'board=', isBoardHtml(html));
+  console.log('[fetch] status=', res.status, 'bytes=', html.length, 'board=', isBoardHtml(html),
+    'cookies=', FM_COOKIES ? 'yes' : 'no');
   return isBoardHtml(html) ? html : null;
 }
 
@@ -56,22 +69,47 @@ async function tryBrowser() {
       viewport: { width: 1280, height: 800 },
       extraHTTPHeaders: FETCH_HEADERS,
     });
+    if (FM_COOKIES) {
+      const cookies = cookieHeaderPairs().map((c) => ({
+        name: c.name, value: c.value,
+        domain: '.fmkorea.com', path: '/',
+      }));
+      await ctx.addCookies(cookies);
+    }
     const page = await ctx.newPage();
     await page.goto(BOARD_URL, { waitUntil: 'domcontentloaded', timeout: 40000 });
 
-    // 보안 시스템(Turnstile) 페이지면 자동 통과 후 reload를 최대 150초 대기
+    // 보안 시스템(Turnstile) 페이지면 자동 통과 후 reload 최대 150초 대기
     const deadline = Date.now() + 150000;
+    let poll = 0;
     while (Date.now() < deadline) {
       const html = await page.content();
       if (isBoardHtml(html)) {
         console.log('[browser] board visible after tries');
         return html;
       }
-      const title = (await page.title()) || '';
-      console.log('[browser] waiting challenge... title=', title.slice(0, 40));
-      await page.waitForTimeout(3000);
+      poll += 1;
+      // 진단: 토큰 상태 / js_info / 위젯 오류 문구 (10초마다)
+      if (poll % 4 === 1) {
+        const diag = await page.evaluate(() => {
+          const i = document.querySelector("input[name='cf-turnstile-response']");
+          const info = document.getElementById('js_info');
+          const bodyTxt = document.body ? document.body.innerText.replace(/\s+/g, ' ').slice(0, 200) : '';
+          return {
+            title: document.title,
+            token: i ? (i.value ? 'SET(len=' + i.value.length + ')' : 'empty') : 'noinput',
+            info: info ? info.textContent.trim().slice(0, 100) : '',
+            bodyTxt,
+          };
+        });
+        console.log('[diag]', JSON.stringify(diag));
+      }
+      await page.waitForTimeout(2000);
     }
     const last = await page.content();
+    fs.mkdirSync(path.join(ROOT, 'artifacts'), { recursive: true });
+    fs.writeFileSync(path.join(ROOT, 'artifacts', 'challenge.html'), last, 'utf8');
+    await page.screenshot({ path: path.join(ROOT, 'artifacts', 'challenge.png'), fullPage: true }).catch(() => {});
     console.log('[browser] timeout: challenge not resolved. bytes=', last.length);
     return null;
   } finally {
